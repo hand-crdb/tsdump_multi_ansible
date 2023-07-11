@@ -1,0 +1,91 @@
+---
+# This Ansible script helps you extract time series data and statement/transaction metrics 
+# from one or more CockroachDB clusters for offline review.
+# 
+# EXAMPLE:
+#
+# $ ansible-playbook -v -i my_inventory.ini tsdump_multi_ansible.yaml 
+# 
+# where my-inventory.ini lists at least 1 host in the 'cockroachdb' group.
+#
+# *** See the accompanying README.md file for details, including configuration info ***
+
+- name: playbook - collect tsdump and statement and transaction statistics
+  hosts: cockroachdb
+  gather_facts: no
+  become: yes
+  tags:
+    - stats
+  tasks:
+
+    - name: task - Set variables
+      set_fact:
+        ts_top_level_dir: "{{ ts_top_level if ts_top_level is defined else './ts_top_level' }}"
+        cockroach_cmd: "{{ cockroach_dir + '/cockroach' if cockroach_dir is defined else 'cockroach' }}"
+        ts_from_datetime_spec: "{{ from_datetime_spec if from_datetime_spec is defined else '3 days ago' }}"
+
+    - name: task - create temp dir
+      run_once: false
+      shell: |
+        mktemp -d -t temp_ts.XXXXXXXXXX
+      register: ts_temp_dir
+
+    - name: task - calculate datetime for tsdump --from option and SQL WHERE clauses
+      run_once: false
+      shell: |
+        date --date="{{ ts_from_datetime_spec }}" +'%Y-%m-%d %H:%M:%S'
+      register: ts_from_datetime
+
+    - name: task - tsdump
+      run_once: false
+      shell: |
+        {{ cockroach_cmd }} debug tsdump \
+          {{ '--certs-dir=' + cert_dir if cert_dir is defined else '--insecure' }} \
+          --format raw \
+          --from="{{ ts_from_datetime.stdout }}" \
+          | gzip \
+          > {{ ts_temp_dir.stdout }}/tsdump.raw.gz
+        
+    - name: task - statement_statistics
+      run_once: false
+      shell: |
+        {{ cockroach_cmd }} sql \
+          {{ '--certs-dir=' + cert_dir if cert_dir is defined else '--insecure' }} \
+          --format csv \
+          -e "SELECT * FROM system.statement_statistics WHERE LENGTH(BTRIM(app_name)) != 0 AND aggregated_ts >= '{{ ts_from_datetime.stdout }}'" \
+          | gzip \
+          > {{ ts_temp_dir.stdout }}/ss.csv.gz
+
+    - name: task - transaction_statistics
+      run_once: false
+      shell: |
+        {{ cockroach_cmd }} sql \
+          {{ '--certs-dir=' + cert_dir if cert_dir is defined else '--insecure' }} \
+          --format csv \
+          -e "SELECT * FROM system.transaction_statistics WHERE LENGTH(BTRIM(app_name)) != 0 AND aggregated_ts >= '{{ ts_from_datetime.stdout }}'" \
+          | gzip \
+          > {{ ts_temp_dir.stdout }}/ts.csv.gz
+
+    - name: task - generate store ID to node ID mapping file
+      run_once: false
+      shell: |
+        {{ cockroach_cmd }} sql \
+          {{ '--certs-dir=' + cert_dir if cert_dir is defined else '--insecure' }} \
+          -e "SELECT store_id || ': ' || node_id FROM crdb_internal.kv_store_status" \
+          | tail -n +2 > {{ ts_temp_dir.stdout }}/tsdump.gob.yaml
+
+#   - name: task - Print hostvars for debugging
+#     ansible.builtin.debug:
+#       var: hostvars
+
+    - name: task - download files to localhost
+      run_once: false
+      ansible.builtin.fetch:
+        src: "{{ ts_temp_dir.stdout }}/{{ item }}"
+        dest: "{{ ts_top_level_dir }}/{{ inventory_hostname }}/{{ item }}"
+        flat: true
+      loop:
+        - ss.csv.gz
+        - ts.csv.gz
+        - tsdump.raw.gz
+        - tsdump.gob.yaml
